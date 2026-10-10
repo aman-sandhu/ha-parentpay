@@ -14,6 +14,7 @@ from .const import (
     LOGIN_FIELD_PASSWORD,
     LOGIN_FIELD_USER,
     LOGIN_URL,
+    MENU_CHOICES_URL,
     PAYMENT_ITEMS_URL,
 )
 from .exceptions import ParentPayAuthError
@@ -144,6 +145,16 @@ class ParentPayClient:
     async def fetch_payment_items(self) -> list[PaymentItem]:
         body = await self._authed_get(PAYMENT_ITEMS_URL)
         return parse_payment_items(body)
+
+    async def fetch_menu_choices(self, consumer_id: str, date_str: str) -> str:
+        """Fetch the weekly MenusAndChoices grid HTML for one child.
+
+        ``date_str`` is any ``YYYY-MM-DD`` in the wanted week — the page returns
+        the whole Mon-Fri week it falls in. Returns raw HTML for
+        ``parsers.parse_menu_choices`` (kept separate so the parser stays pure).
+        """
+        url = f"{MENU_CHOICES_URL}?ConsumerId={consumer_id}&Date={date_str}"
+        return await self._authed_get(url)
 
     async def fetch_payment_detail(
         self, tid: str, u: str

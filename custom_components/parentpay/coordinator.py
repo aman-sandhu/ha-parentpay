@@ -25,13 +25,18 @@ from .const import (
     DOMAIN,
 )
 from .exceptions import ParentPayAuthError, ParentPayError
-from .models import ArchiveRow
-from .parsers import extract_receipt_ids
+from .models import ArchiveRow, MenuItem
+from .parsers import extract_receipt_ids, parse_menu_choices
 from .store import ParentPayStore
 
 _LOGGER = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+# Only itemise meals for recent weeks. The backfill holds ~12 months of meal
+# days and the card shows ~30 days, so fetching every historical week's
+# MenusAndChoices page would be a request storm for no visible benefit.
+_MEAL_DETAIL_WEEKS = 10
 
 
 class ParentPayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -54,6 +59,11 @@ class ParentPayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._options = options
         self.store = ParentPayStore(hass)
         self._first_run_done = False
+        # In-memory meal itemisation cache (child_id|date_iso -> items). Historical
+        # weeks are immutable so they are fetched once per HA run; the current week
+        # refreshes every poll. Not persisted — repopulated cheaply on restart.
+        self._meal_details: dict[str, list[MenuItem]] = {}
+        self._meal_weeks_done: set[str] = set()
         # Names of supplementary fetches that failed on the most recent
         # poll and fell back to stale/empty data. Surfaced in diagnostics.
         self.degraded_legs: list[str] = []
@@ -79,6 +89,7 @@ class ParentPayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "items": [],
                 "meals": [],
                 "purchases": [],
+                "meal_items": {},
             }
 
         previous = self.data or {}
@@ -113,12 +124,17 @@ class ParentPayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.store.async_merge(enriched_payments)
             await self.store.async_merge(archive_rows)
 
+            # Itemise recent meals from MenusAndChoices (best-effort; degrades
+            # to the coarse archive summary and never fails the poll).
+            await self._enrich_meal_details()
+
             self._first_run_done = True
             return {
                 "balances": home.balances,
                 "items": items,
                 "meals": self.store.meals,
                 "purchases": self.store.purchases,
+                "meal_items": dict(self._meal_details),
             }
         except ParentPayAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
@@ -152,6 +168,60 @@ class ParentPayCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 err,
             )
             return fallback
+
+    async def _enrich_meal_details(self) -> None:
+        """Fetch per-day meal itemisation for the recent meal days we hold.
+
+        One MenusAndChoices request returns a whole Mon-Fri week, so we fetch at
+        most once per (child, week). Historical weeks are cached for the life of
+        the process; the current week is refreshed every poll. Weeks older than
+        ``_MEAL_DETAIL_WEEKS`` are skipped entirely. Any failure degrades to the
+        coarse archive data already in the store and never fails the poll.
+        """
+        meals = self.store.meals
+        if not meals:
+            return
+
+        today = dt_util.now().date()
+        current_monday = today - timedelta(days=today.weekday())
+        cutoff_monday = current_monday - timedelta(weeks=_MEAL_DETAIL_WEEKS)
+
+        weeks: dict[tuple[str, date], list[str]] = defaultdict(list)
+        for row in meals:
+            child_id = str(row.get("child_id") or "")
+            day_iso = str(row.get("date") or "")
+            if not child_id or not day_iso:
+                continue
+            try:
+                day = date.fromisoformat(day_iso)
+            except ValueError:
+                continue
+            monday = day - timedelta(days=day.weekday())
+            if monday < cutoff_monday:
+                continue
+            weeks[(child_id, monday)].append(day_iso)
+
+        for (child_id, monday), day_isos in weeks.items():
+            week_key = f"{child_id}|{monday.isoformat()}"
+            is_current = monday >= current_monday
+            if week_key in self._meal_weeks_done and not is_current:
+                continue
+            try:
+                html = await self._client.fetch_menu_choices(child_id, max(day_isos))
+                parsed = parse_menu_choices(html, monday.year)
+            except Exception as err:  # itemisation is best-effort, never fatal
+                # Never fail the poll for meal itemisation: the coarse archive
+                # summary is already in the store and shown as a fallback.
+                if "meal_details" not in self.degraded_legs:
+                    self.degraded_legs.append("meal_details")
+                _LOGGER.warning(
+                    "ParentPay meal-detail fetch failed for %s: %s", week_key, err
+                )
+                continue
+            for day_iso, item_list in parsed.items():
+                self._meal_details[f"{child_id}|{day_iso}"] = item_list
+            if not is_current:
+                self._meal_weeks_done.add(week_key)
 
     async def _maybe_run_backfill(self) -> None:
         """Run the one-shot 12-month backfill if it hasn't succeeded yet.

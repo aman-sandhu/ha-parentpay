@@ -12,6 +12,9 @@ LOGIN_URL: Final = "https://app.parentpay.com/public/api/security/authentication
 HOME_URL: Final = "https://app.parentpay.com/V3Payer4W3/Payer/Default.aspx"
 PAYMENT_ITEMS_URL: Final = "https://app.parentpay.com/V3Payer4W3/Home/PaymentItems/PaymentItems.aspx"
 ARCHIVE_URL: Final = "https://app.parentpay.com/V3Payer4VBW3/Consumer/MS_Archive.aspx"
+# Weekly meal grid with the real per-item morning/lunch choices and prices.
+# GET ?ConsumerId={cid}&Date={YYYY-MM-DD} returns the Mon-Fri week of that date.
+MENU_CHOICES_URL: Final = "https://app.parentpay.com/V3Payer4W3/Payer/MenusAndChoices.aspx"
 
 # --- Login form field names ---------------------------------------------
 

@@ -15,6 +15,7 @@ from .exceptions import ParentPayParseError
 from .models import (
     ArchiveRow,
     Balance,
+    MenuItem,
     PaymentDetailItem,
     PaymentItem,
     WebFormsState,
@@ -439,3 +440,105 @@ def parse_webforms_state(html: str) -> WebFormsState:
         viewstategenerator=fields["__VIEWSTATEGENERATOR"],
         eventvalidation=fields["__EVENTVALIDATION"],
     )
+
+
+# --- MenusAndChoices.aspx weekly meal grid ---------------------------------
+
+_MENU_MONTHS: dict[str, int] = {
+    m: i
+    for i, m in enumerate(
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+        1,
+    )
+}
+_MENU_SESSION_LABELS: frozenset[str] = frozenset(
+    {"Morning", "Lunch time", "Afternoon", "Break", "Breakfast"}
+)
+_MENU_HEADER_DATE_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]{3})")
+_MENU_PRICE_TAIL_RE = re.compile(r"(\d+(?:\.\d{1,2})?)\s*$")
+_MENU_PRICE_STRIP_RE = re.compile(r"\s*-?\s*£?\s*\d+(?:\.\d{1,2})?\s*$")
+
+
+def _menu_header_dates(header_cells: list[Tag], ref_year: int) -> list[date | None]:
+    """Map each column header ("Fri 9 Oct") to a date.
+
+    Headers omit the year, so ``ref_year`` seeds it; if the month decreases
+    across columns the week straddles 31 Dec and the year rolls forward.
+    """
+    dates: list[date | None] = []
+    prev_month: int | None = None
+    year = ref_year
+    for th in header_cells:
+        m = _MENU_HEADER_DATE_RE.search(th.get_text(" ", strip=True))
+        if not m:
+            dates.append(None)
+            continue
+        month = _MENU_MONTHS.get(m.group(2).title())
+        if month is None:
+            dates.append(None)
+            continue
+        if prev_month is not None and month < prev_month:
+            year += 1
+        prev_month = month
+        try:
+            dates.append(date(year, month, int(m.group(1))))
+        except ValueError:
+            dates.append(None)
+    return dates
+
+
+def parse_menu_choices(html: str, ref_year: int) -> dict[str, list[MenuItem]]:
+    """Parse the weekly MenusAndChoices grid into the taken items per date.
+
+    Returns ``{date_iso: [MenuItem, ...]}``. Only cells flagged "Taken" (a tick
+    image or the ``success`` cell class) are included — those are the items the
+    pupil actually had and was charged for. A session label ("Morning", "Lunch
+    time") carries down to the items beneath it in the same column.
+
+    The columns are Mon-Fri of the requested week; a cell can be empty (no
+    choice that session). Prices are embedded in the item text in mixed forms
+    ("Cheese Pizza - 1.95", "Wedges £1.60", "Hash Browns x2 1.40") and parsed
+    to int pence.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    grid: Tag | None = None
+    for table in soup.find_all("table"):
+        header_cells = table.select("thead th")
+        if header_cells and any(
+            _MENU_HEADER_DATE_RE.search(th.get_text(" ", strip=True)) for th in header_cells
+        ):
+            grid = table
+            break
+    if grid is None:
+        return {}
+
+    col_dates = _menu_header_dates(grid.select("thead th"), ref_year)
+    out: dict[str, list[MenuItem]] = {}
+    session: list[str | None] = [None] * len(col_dates)
+
+    for row in grid.select("tbody > tr"):
+        for col, cell in enumerate(row.find_all("td", recursive=False)):
+            if col >= len(col_dates):
+                continue
+            day = col_dates[col]
+            if day is None:
+                continue
+            strong = cell.find("strong")
+            if strong is None:
+                continue
+            text = strong.get_text(" ", strip=True)
+            if text in _MENU_SESSION_LABELS:
+                session[col] = text
+                continue
+            classes = list(cell.get("class") or [])
+            taken = cell.find("img", alt="Taken") is not None or "success" in classes
+            if not taken:
+                continue
+            price_match = _MENU_PRICE_TAIL_RE.search(text)
+            amount_pence = round(float(price_match.group(1)) * 100) if price_match else 0
+            name = _MENU_PRICE_STRIP_RE.sub("", text).strip() or text
+            out.setdefault(day.isoformat(), []).append(
+                MenuItem(session=session[col], item=name, amount_pence=amount_pence)
+            )
+    return out

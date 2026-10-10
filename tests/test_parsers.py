@@ -16,6 +16,7 @@ from custom_components.parentpay.parsers import (
     parse_home_balances,
     parse_home_recent_payments,
     parse_login_response,
+    parse_menu_choices,
     parse_payment_detail,
     parse_payment_items,
     parse_webforms_state,
@@ -233,3 +234,42 @@ def test_parse_webforms_state_raises_when_token_missing() -> None:
     """
     with pytest.raises(ParentPayParseError):
         parse_webforms_state(html)
+
+
+def test_parse_menu_choices_itemises_taken_meals() -> None:
+    result = parse_menu_choices(_load_text("menu_choices.html"), 2026)
+
+    # Wed has no items; Fri's only item was not "Taken" — both excluded.
+    assert set(result) == {"2026-10-05", "2026-10-06", "2026-10-08"}
+
+    # Session labels carry down; prices parsed from all three spellings.
+    assert result["2026-10-05"] == [
+        {"session": "Morning", "item": "Cheese Pizza", "amount_pence": 195},
+        {"session": "Lunch time", "item": "Popcorn", "amount_pence": 0},
+    ]
+    assert result["2026-10-06"] == [
+        {"session": "Morning", "item": "Wedges", "amount_pence": 160},
+    ]
+    assert result["2026-10-08"] == [
+        {"session": "Morning", "item": "Hash Browns x2", "amount_pence": 140},
+        {"session": "Lunch time", "item": "Cheese Pizza", "amount_pence": 195},
+    ]
+
+
+def test_parse_menu_choices_rolls_year_across_december() -> None:
+    html = """
+    <table><thead><tr>
+      <th>Mon 29 Dec</th><th>Fri 2 Jan</th>
+    </tr></thead><tbody>
+      <tr>
+        <td class="success"><strong><img alt="Taken"/>&nbsp;Soup - 1.00</strong></td>
+        <td class="success"><strong><img alt="Taken"/>&nbsp;Soup - 1.00</strong></td>
+      </tr>
+    </tbody></table>
+    """
+    result = parse_menu_choices(html, 2025)
+    assert set(result) == {"2025-12-29", "2026-01-02"}
+
+
+def test_parse_menu_choices_empty_when_no_grid() -> None:
+    assert parse_menu_choices("<html><body><p>nothing</p></body></html>", 2026) == {}

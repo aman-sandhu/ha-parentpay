@@ -147,7 +147,14 @@ class AvailableItemsSensor(_BaseChildSensor):
 
 
 class SpentTodaySensor(_BaseChildSensor):
-    """Total meal spend for this child today, with a per-day history in attributes."""
+    """Total meal spend for this child today, with a per-day history in attributes.
+
+    Prefers the real per-item morning/lunch breakdown from MenusAndChoices
+    (coordinator ``meal_items``) when available, falling back to the coarse
+    archive meal summary otherwise. All figures are positive pounds spent, and
+    each day's ``items`` carry the price inline ("Cheese Pizza - 1.95") so the
+    dashboard card can show an itemised breakdown.
+    """
 
     _attr_device_class = SensorDeviceClass.MONETARY
     _attr_native_unit_of_measurement = "GBP"
@@ -163,49 +170,71 @@ class SpentTodaySensor(_BaseChildSensor):
         super().__init__(coordinator, entry, child_id)
         self._attr_unique_id = f"{entry.entry_id}_{child_id}_spent_today"
 
-    def _meals(self) -> list[dict[str, Any]]:
+    def _coarse_meals(self) -> list[dict[str, Any]]:
         meals = self.coordinator.data.get("meals") or []
         return [m for m in meals if str(m.get("child_id")) == self._child_id]
+
+    def _detail(self) -> dict[str, list[dict[str, Any]]]:
+        return self.coordinator.data.get("meal_items") or {}
+
+    def _day_map(self) -> dict[str, dict[str, Any]]:
+        """Per-date ``{"pence": int, "items": [str]}`` merging detail over coarse."""
+        detail = self._detail()
+        prefix = f"{self._child_id}|"
+
+        coarse_pence: dict[str, int] = defaultdict(int)
+        coarse_items: dict[str, list[str]] = defaultdict(list)
+        for m in self._coarse_meals():
+            day = str(m.get("date") or "")
+            if not day:
+                continue
+            coarse_pence[day] += abs(int(m.get("amount_pence", 0) or 0))
+            if m.get("item"):
+                coarse_items[day].append(str(m["item"]))
+
+        dates: set[str] = set(coarse_pence)
+        dates.update(key[len(prefix):] for key in detail if key.startswith(prefix))
+
+        out: dict[str, dict[str, Any]] = {}
+        for day in dates:
+            items = detail.get(prefix + day)
+            if items:
+                pence = sum(abs(int(it.get("amount_pence", 0) or 0)) for it in items)
+                names = [
+                    f"{it.get('item', '')} - {abs(int(it.get('amount_pence', 0) or 0)) / 100:.2f}"
+                    for it in items
+                ]
+                out[day] = {"pence": pence, "items": names}
+            else:
+                out[day] = {"pence": coarse_pence.get(day, 0), "items": coarse_items.get(day, [])}
+        return out
 
     @property
     def native_value(self) -> float:
         today = dt_util.now().date().isoformat()
-        pence = sum(
-            int(m.get("amount_pence", 0) or 0)
-            for m in self._meals()
-            if m.get("date") == today
-        )
+        pence = int(self._day_map().get(today, {}).get("pence", 0) or 0)
         return round(pence / 100, 2)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        amt_by_day: dict[str, int] = defaultdict(int)
-        items_by_day: dict[str, list[str]] = defaultdict(list)
-        for m in self._meals():
-            d = str(m.get("date") or "")
-            if not d:
-                continue
-            amt_by_day[d] += int(m.get("amount_pence", 0) or 0)
-            if m.get("item"):
-                items_by_day[d].append(str(m["item"]))
-
+        day_map = self._day_map()
         days: list[dict[str, Any]] = []
-        for d in sorted(amt_by_day.keys(), reverse=True)[:30]:
+        for day in sorted(day_map.keys(), reverse=True)[:30]:
             try:
-                label = date.fromisoformat(d).strftime("%a %-d %b")
+                label = date.fromisoformat(day).strftime("%a %-d %b")
             except ValueError:
-                label = d
+                label = day
             days.append(
                 {
-                    "date": d,
+                    "date": day,
                     "label": label,
-                    "amount": round(amt_by_day[d] / 100, 2),
-                    "items": items_by_day.get(d, []),
+                    "amount": round(day_map[day]["pence"] / 100, 2),
+                    "items": day_map[day]["items"],
                 }
             )
 
-        last_7 = round(sum(day["amount"] for day in days[:7]), 2)
-        last_30 = round(sum(day["amount"] for day in days), 2)
+        last_7 = round(sum(d["amount"] for d in days[:7]), 2)
+        last_30 = round(sum(d["amount"] for d in days), 2)
         return {
             "currency": "GBP",
             "last_7_days_total": last_7,

@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from typing import TypedDict
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,3 +80,16 @@ class WebFormsState:
     viewstate: str
     viewstategenerator: str
     eventvalidation: str
+
+
+class MenuItem(TypedDict):
+    """One 'Taken' meal item parsed from the MenusAndChoices weekly grid.
+
+    Plain dict (not a dataclass) so it round-trips through coordinator data and
+    diagnostics as JSON without custom serialisation. Amount is int pence, per
+    the domain invariant.
+    """
+
+    session: str | None
+    item: str
+    amount_pence: int
